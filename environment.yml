@@ -1,0 +1,28 @@
+name: ecg
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - jupyter
+  - ipykernel
+  - pip
+
+  - pip:
+      - transformers>=4.40.0
+      - accelerate
+      - peft
+      - datasets
+      - einops
+      - tqdm
+      - huggingface-hub
