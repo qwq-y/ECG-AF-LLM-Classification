@@ -17,7 +17,11 @@ Jsonl format:
 {
     "file_name": name,
     "instruction": "请判断这个ECG信号是否有房颤？",
-    "answer": "有房颤。" if label == 1 else "无房颤。",
+    "answer": (
+        "有房颤。"
+        if label == 1
+        else "无房颤。"
+    ),
 }
 
 Features are deprecated in the dataset, and the residual encoder code is dummy.
@@ -70,7 +74,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[2] / "data" / "dummy_llm"),
+        default=str(Path(__file__).resolve().parents[2] / "data" / "llm_cv0"),
     )
     args = parser.parse_args()
 

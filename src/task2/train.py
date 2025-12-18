@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 from .llm_model import ECGQwenForAF, DEFAULT_QWEN_NAME, apply_lora_to_llm
+from .loss_utils import classification_loss, aggregate_metrics
 
 import warnings
 
@@ -56,23 +57,32 @@ class ECGAFLLMDataset(Dataset):
         ecg_len: int = 2400,
         downsample: int = 3,
         is_train: bool = True,
+        preprocessed_npz: Optional[str] = None,
     ):
         self.items: List[Dict[str, Any]] = []
         self.mat_dir = Path(mat_dir)
         self.ecg_len = ecg_len
         self.downsample = downsample
         self.is_train = is_train
+        self.preprocessed_npz = preprocessed_npz
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 obj = json.loads(line)
+                ans = obj["answer"].strip()
+                label = 1 if "有房颤" in ans else 0
                 self.items.append(
                     {
                         "file_name": obj["file_name"],
                         "instruction": obj["instruction"],
-                        "answer": obj["answer"],
+                        "answer": ans,
+                        "label": label,
                     }
                 )
+
+        self._preprocessed_cache: Optional[Dict[str, np.ndarray]] = None
+        if self.preprocessed_npz is not None:
+            self._load_preprocessed_cache(self.preprocessed_npz)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -85,58 +95,58 @@ class ECGAFLLMDataset(Dataset):
         sig = np.asarray(data).reshape(-1)
         return sig
 
+    def _load_preprocessed_cache(self, path: str) -> None:
+        cache = np.load(path, allow_pickle=True)
+        ecg = cache["ecg"]
+        file_names = cache["file_name"]
+        if ecg.shape[0] != len(self.items):
+            raise ValueError(
+                f"Preprocessed NPZ length {ecg.shape[0]} does not match JSON length {len(self.items)}"
+            )
+        for idx, (item, cached_name) in enumerate(zip(self.items, file_names)):
+            if item["file_name"] != str(cached_name):
+                raise ValueError(
+                    f"Mismatch at index {idx}: JSON file {item['file_name']} != NPZ entry {cached_name}"
+                )
+        if ecg.shape[1] != self.ecg_len:
+            raise ValueError(
+                f"Preprocessed ECG length {ecg.shape[1]} != expected ecg_len {self.ecg_len}"
+            )
+        cache.close()
+        self._preprocessed_cache = {"ecg": ecg}
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         it = self.items[idx]
-        sig = self._load_mat(it["file_name"])
-        sig = _ecg_preprocess(
-            sig,
-            out_len=self.ecg_len,
-            downsample=self.downsample,
-            random_crop=self.is_train,
-        )
+        if self._preprocessed_cache is not None:
+            sig = self._preprocessed_cache["ecg"][idx]
+        else:
+            sig = self._load_mat(it["file_name"])
+            sig = _ecg_preprocess(
+                sig,
+                out_len=self.ecg_len,
+                downsample=self.downsample,
+                random_crop=self.is_train,
+            )
         ecg = torch.from_numpy(sig).unsqueeze(0)
         prompt = f"{it['instruction']}\n答："
-        full_text = f"{prompt}{it['answer']}"
-        return {"ecg": ecg, "prompt": prompt, "text": full_text}
+        return {"ecg": ecg, "prompt": prompt, "label": it["label"]}
 
 
 def make_collate_fn(tokenizer, max_length: int = 512):
-    printed = False  # closure flag
-    
     def collate_fn(batch: List[Dict[str, Any]]):
-        nonlocal printed
-        
         ecg = torch.stack([b["ecg"] for b in batch], dim=0)
         prompts = [b["prompt"] for b in batch]
-        texts = [b["text"] for b in batch]
 
-        enc_full = tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-        )
-        input_ids = enc_full["input_ids"]
-        attention_mask = enc_full["attention_mask"]
-
-        enc_prompt = tokenizer(
+        encoded = tokenizer(
             prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=max_length,
         )
-        prompt_attn = enc_prompt["attention_mask"]
-        prompt_lens = prompt_attn.sum(dim=1)
+        labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
 
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-        for i, plen in enumerate(prompt_lens.tolist()):
-            plen = int(plen)
-            labels[i, :plen] = -100
-
-        return ecg, input_ids, attention_mask, labels
+        return ecg, encoded["input_ids"], encoded["attention_mask"], labels
 
     return collate_fn
 
@@ -154,6 +164,8 @@ def train(
     output_dir: str,
     llm_name: str = DEFAULT_QWEN_NAME,
     encoder_ckpt: Optional[str] = None,
+    train_ecg_npz: Optional[str] = None,
+    val_ecg_npz: Optional[str] = None,
     ecg_len: int = 2400,
     downsample: int = 3,
     batch_size: int = 4,
@@ -169,10 +181,12 @@ def train(
     stage1_lr: Optional[float] = None,
     stage2_adapter_lr: Optional[float] = None,
     stage2_lora_lr: Optional[float] = None,
+    metric_weight: float = 10.0,
+    accuracy_weight: float = 1.0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    stage1_epochs = max(stage1_epochs, 0)
+    stage1_epochs = max(stage1_epochs if stage1_epochs is not None else 0, 0)
     stage2_epochs = max(stage2_epochs, 0)
     total_epochs = stage1_epochs + stage2_epochs
 
@@ -203,6 +217,7 @@ def train(
         ecg_len=ecg_len,
         downsample=downsample,
         is_train=True,
+        preprocessed_npz=train_ecg_npz,
     )
     val_dataset = ECGAFLLMDataset(
         jsonl_path=val_path,
@@ -210,6 +225,7 @@ def train(
         ecg_len=ecg_len,
         downsample=downsample,
         is_train=False,
+        preprocessed_npz=val_ecg_npz,
     )
 
     train_loader = DataLoader(
@@ -229,7 +245,11 @@ def train(
         pin_memory=torch.cuda.is_available(),
     )
 
-    adapter_params = list(model.ecg_adapter.parameters()) + list(model.proj.parameters())
+    adapter_params = (
+        list(model.ecg_adapter.parameters())
+        + list(model.proj.parameters())
+        + list(model.classifier.parameters())
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -300,26 +320,36 @@ def train(
         for local_epoch in range(start_epoch, max_epoch):
             total_loss = 0.0
             did_step = 0
-            zero_sup_batches = 0
+            train_stats = {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
 
             for batch in train_loader:
-                ecg, input_ids, attention_mask, labels = batch
+                ecg, input_ids, attention_mask, cls_labels = batch
                 ecg = ecg.to(device, non_blocking=True)
                 input_ids = input_ids.to(device, non_blocking=True)
                 attention_mask = attention_mask.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+                cls_labels = cls_labels.to(device, non_blocking=True)
 
-                sup_mask = (labels != -100)
-                if int(sup_mask.sum().item()) == 0:
-                    zero_sup_batches += 1
-
-                outputs = model(
+                logits = model.classify(
                     ecg=ecg,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    labels=labels,
                 )
-                loss = outputs.loss
+                loss, _loss_metrics = classification_loss(
+                    logits,
+                    cls_labels,
+                    metric_weight=metric_weight,
+                    accuracy_weight=accuracy_weight,
+                )
+
+                # compute discrete (thresholded) metrics for logging/aggregation
+                with torch.no_grad():
+                    probs = torch.sigmoid(logits.detach())
+                    preds = (probs >= 0.5).float()
+                    tp = float(((preds == 1) & (cls_labels == 1)).sum().item())
+                    fp = float(((preds == 1) & (cls_labels == 0)).sum().item())
+                    fn = float(((preds == 0) & (cls_labels == 1)).sum().item())
+                    tn = float(((preds == 0) & (cls_labels == 0)).sum().item())
+
                 loss.backward()
 
                 optimizer.step()
@@ -329,53 +359,73 @@ def train(
                 global_step += 1
                 did_step += 1
                 total_loss += float(loss.item())
+                train_stats["tp"] += tp
+                train_stats["fp"] += fp
+                train_stats["fn"] += fn
+                train_stats["tn"] += tn
 
-            avg_train_loss = total_loss / max(len(train_loader), 1)
-
-            if did_step == 0:
-                print("WARNING: optimizer.step() never called in this epoch. Check len(train_loader).", flush=True)
-            if zero_sup_batches > 0:
-                print(
-                    f"WARNING: {zero_sup_batches}/{len(train_loader)} batches have 0 supervised tokens "
-                    f"(all labels=-100). Try increasing max_length.",
-                    flush=True,
-                )
+            avg_train_loss = total_loss / max(did_step, 1)
+            train_metrics = aggregate_metrics(train_stats)
 
             model.eval()
             val_loss = 0.0
             zero_loss = 0.0
+            val_stats = {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
             with torch.no_grad():
                 for batch in val_loader:
-                    ecg, input_ids, attention_mask, labels = batch
+                    ecg, input_ids, attention_mask, cls_labels = batch
                     ecg = ecg.to(device, non_blocking=True)
                     input_ids = input_ids.to(device, non_blocking=True)
                     attention_mask = attention_mask.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
+                    cls_labels = cls_labels.to(device, non_blocking=True)
 
-                    outputs = model(
+                    logits = model.classify(
                         ecg=ecg,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels,
                     )
-                    zero_outputs = model(
+                    loss, _loss_metrics = classification_loss(
+                        logits,
+                        cls_labels,
+                        metric_weight=metric_weight,
+                        accuracy_weight=accuracy_weight,
+                    )
+                    val_loss += float(loss.item())
+
+                    # discrete metrics for validation logging (match evaluate)
+                    probs = torch.sigmoid(logits)
+                    preds = (probs >= 0.5).float()
+                    val_stats["tp"] += float(((preds == 1) & (cls_labels == 1)).sum().item())
+                    val_stats["fp"] += float(((preds == 1) & (cls_labels == 0)).sum().item())
+                    val_stats["fn"] += float(((preds == 0) & (cls_labels == 1)).sum().item())
+                    val_stats["tn"] += float(((preds == 0) & (cls_labels == 0)).sum().item())
+
+                    zero_logits = model.classify(
                         ecg=torch.zeros_like(ecg),
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=labels,
                     )
-
-                    val_loss += outputs.loss.item()
-                    zero_loss += zero_outputs.loss.item()
+                    zero_loss_batch, _ = classification_loss(
+                        zero_logits,
+                        cls_labels,
+                        metric_weight=metric_weight,
+                        accuracy_weight=accuracy_weight,
+                    )
+                    zero_loss += float(zero_loss_batch.item())
 
             avg_val_loss = val_loss / max(len(val_loader), 1)
             avg_zero_loss = zero_loss / max(len(val_loader), 1)
+            val_metrics = aggregate_metrics(val_stats)
             overall_epoch = global_epoch + 1
             total_epoch_denom = max(total_epochs, 1)
             stage_epoch_idx = local_epoch + 1
             print(
                 f"[{stage_name}] Epoch {overall_epoch}/{total_epoch_denom} (stage {stage_epoch_idx}/{max_epoch}) | "
-                f"train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f} | zero_loss{avg_zero_loss:.4f}"
+                f"train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f} | zero_loss={avg_zero_loss:.4f} | "
+                f"train_precision={train_metrics['precision']:.3f} | train_recall={train_metrics['recall']:.3f} | "
+                f"train_f1={train_metrics['f1']:.3f} | val_precision={val_metrics['precision']:.3f} | "
+                f"val_recall={val_metrics['recall']:.3f} | val_f1={val_metrics['f1']:.3f}",
+                flush=True,
             )
             model.train()
 
@@ -491,13 +541,37 @@ def parse_args():
     parser.add_argument("--llm-name", type=str, default=DEFAULT_QWEN_NAME)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--ecg_token_count", type=int, default=16)
+    parser.add_argument(
+        "--metric-weight",
+        type=float,
+        default=10.0,
+        help="Weight applied to precision/recall/F1 penalties inside the loss.",
+    )
+    parser.add_argument(
+        "--accuracy-weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the differentiable accuracy term inside the loss.",
+    )
+    parser.add_argument(
+        "--train-ecg-npz",
+        type=str,
+        default=None,
+        help="Path to preprocessed ECG cache for the training JSONL.",
+    )
+    parser.add_argument(
+        "--val-ecg-npz",
+        type=str,
+        default=None,
+        help="Path to preprocessed ECG cache for the validation JSONL.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     data_root = Path(args.data_root)
-    train_path = data_root / f"mm_instructions_train_cv{args.cv}_posx10.jsonl"
+    train_path = data_root / f"mm_instructions_train_cv{args.cv}.jsonl"
     val_path = data_root / f"mm_instructions_val_cv{args.cv}.jsonl"
 
     train(
@@ -507,6 +581,8 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         llm_name=args.llm_name,
         encoder_ckpt=args.encoder_ckpt,
+        train_ecg_npz=args.train_ecg_npz,
+        val_ecg_npz=args.val_ecg_npz,
         ecg_len=args.ecg_len,
         downsample=args.downsample,
         batch_size=args.batch_size,
@@ -522,4 +598,6 @@ if __name__ == "__main__":
         stage2_epochs=args.stage2_epochs,
         stage2_adapter_lr=args.stage2_adapter_lr,
         stage2_lora_lr=args.stage2_lora_lr,
+        metric_weight=args.metric_weight,
+        accuracy_weight=args.accuracy_weight,
     )

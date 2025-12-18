@@ -16,23 +16,37 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 class EvalDataset(Dataset):
-    def __init__(self, jsonl_path: str, mat_dir: str, ecg_len: int, downsample: int):
+    def __init__(
+        self,
+        jsonl_path: str,
+        mat_dir: str,
+        ecg_len: int,
+        downsample: int,
+        preprocessed_npz: Optional[str] = None,
+    ):
         self.items: List[Dict[str, Any]] = []
         self.mat_dir = Path(mat_dir)
         self.ecg_len = ecg_len
         self.downsample = downsample
+        self._preprocessed_cache: Optional[Dict[str, np.ndarray]] = None
+
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 obj = json.loads(line)
                 instr = obj["instruction"]
                 prompt = instr + "\n答："
+                ans = obj["answer"].strip()
+                label = 1 if "有房颤" in ans else 0
                 self.items.append(
                     {
                         "file_name": obj["file_name"],
                         "prompt": prompt,
-                        "gt_answer": obj["answer"],
+                        "gt_answer": ans,
+                        "label": label,
                     }
                 )
+        if preprocessed_npz is not None:
+            self._load_preprocessed(preprocessed_npz)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -45,17 +59,40 @@ class EvalDataset(Dataset):
         sig = np.asarray(data).reshape(-1)
         return sig
 
+    def _load_preprocessed(self, path: str) -> None:
+        cache = np.load(path, allow_pickle=True)
+        ecg = cache["ecg"]
+        names = cache["file_name"]
+        if ecg.shape[0] != len(self.items):
+            raise ValueError(
+                f"Preprocessed NPZ len {ecg.shape[0]} != JSON len {len(self.items)}"
+            )
+        for idx, (item, cached_name) in enumerate(zip(self.items, names)):
+            if item["file_name"] != str(cached_name):
+                raise ValueError(
+                    f"Mismatch at index {idx}: JSON {item['file_name']} != NPZ {cached_name}"
+                )
+        if ecg.shape[1] != self.ecg_len:
+            raise ValueError(
+                f"Preprocessed ECG length {ecg.shape[1]} != expected {self.ecg_len}"
+            )
+        cache.close()
+        self._preprocessed_cache = {"ecg": ecg}
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         it = self.items[idx]
-        sig = self._load_mat(it["file_name"])
-        sig = _ecg_preprocess(
-            sig,
-            out_len=self.ecg_len,
-            downsample=self.downsample,
-            random_crop=False,
-        )
+        if self._preprocessed_cache is not None:
+            sig = self._preprocessed_cache["ecg"][idx]
+        else:
+            sig = self._load_mat(it["file_name"])
+            sig = _ecg_preprocess(
+                sig,
+                out_len=self.ecg_len,
+                downsample=self.downsample,
+                random_crop=False,
+            )
         ecg = torch.from_numpy(sig).unsqueeze(0)
-        return {"ecg": ecg, "prompt": it["prompt"], "gt_answer": it["gt_answer"]}
+        return {"ecg": ecg, "prompt": it["prompt"], "gt_answer": it["gt_answer"], "label": it["label"]}
 
 def collate_fn(batch, tokenizer, max_length: int = 512):
     ecg = torch.stack([b["ecg"] for b in batch], dim=0)
@@ -70,13 +107,9 @@ def collate_fn(batch, tokenizer, max_length: int = 512):
         add_special_tokens=True,
     )
 
-    return (
-        ecg,
-        enc["input_ids"],
-        enc["attention_mask"],
-        [b["gt_answer"] for b in batch],
-        prompts,
-    )
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
+
+    return ecg, enc["input_ids"], enc["attention_mask"], [b["gt_answer"] for b in batch], prompts, labels
 
 def load_checkpoint(model: ECGQwenForAF, ckpt_path: str) -> ECGQwenForAF:
     state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -90,34 +123,8 @@ def load_checkpoint(model: ECGQwenForAF, ckpt_path: str) -> ECGQwenForAF:
 
     return model
 
-def extract_label_from_text(text: str) -> int:
-    negative_phrases = [
-        "无房颤", "没房颤", "没有房颤", "不是房颤", "无心房颤动", "没有心房颤动",
-        "no af", "not af"
-    ]
-    positive_phrases = [
-        "有房颤", "是房颤", "心房颤动", "af"
-    ]
-
-    text = text.strip()
-    t = text.lower()
-
-    for p in negative_phrases:
-        if p in text or p in t:
-            return 0
-    for p in positive_phrases:
-        if p in text or p in t:
-            return 1
-
-    return 2
-
-def extract_label_from_gt(gt: str) -> int:
-    gt = gt.strip()
-    if "有房颤" in gt:
-        return 1
-    if "无房颤" in gt:
-        return 0
-    return 0
+def label_to_text(label: int) -> str:
+    return "有房颤。" if label == 1 else "无房颤。"
 
 def evaluate(
     ckpt_path: str,
@@ -125,6 +132,7 @@ def evaluate(
     mat_dir: str,
     llm_name: str = DEFAULT_QWEN_NAME,
     encoder_ckpt: Optional[str] = None,
+    val_ecg_npz: Optional[str] = None,
     ecg_len: int = 2400,
     downsample: int = 3,
     max_length: int = 512,
@@ -155,6 +163,7 @@ def evaluate(
         mat_dir=mat_dir,
         ecg_len=ecg_len,
         downsample=downsample,
+        preprocessed_npz=val_ecg_npz,
     )
     loader = DataLoader(
         dataset,
@@ -165,42 +174,32 @@ def evaluate(
 
     preds: List[int] = []
     gts: List[int] = []
+    probs: List[float] = []
 
-    for idx, (ecg, input_ids, attn_mask, gt_answers, prompts) in enumerate(loader):
+    for idx, (ecg, input_ids, attn_mask, gt_answers, prompts, labels) in enumerate(loader):
         with torch.no_grad():
             ecg = ecg.to(device)
             input_ids = input_ids.to(device)
             attn_mask = attn_mask.to(device)
+            labels = labels.to(device)
 
-            inputs_embeds, full_attention_mask = model.prepare_inputs_for_generation(
+            logits = model.classify(
                 ecg=ecg,
                 input_ids=input_ids,
                 attention_mask=attn_mask,
             )
-            full_attention_mask = full_attention_mask.to(device)
-
-            generated_ids = model.llm.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=full_attention_mask,
-                max_new_tokens=4,
-                do_sample=False,
-                num_beams=1,
-            )
-
-        gen_text = tokenizer.decode(
-            generated_ids[0], skip_special_tokens=True
-        )
-
-        pred_label = extract_label_from_text(gen_text)  # 0/1/2
-        gt_label = extract_label_from_gt(gt_answers[0]) # 0/1
+            prob = torch.sigmoid(logits).squeeze(0).item()
+            pred_label = int(prob >= 0.5)
+            gt_label = int(labels.item())
 
         preds.append(pred_label)
         gts.append(gt_label)
+        probs.append(prob)
 
         if idx % 20 == 0:
             print(f"[{idx}/{len(dataset)}]")
             print("Prompt:", prompts[0])
-            print("Generated:", gen_text)
+            print("Predicted:", label_to_text(pred_label))
             print("GT answer:", gt_answers[0])
             print("-" * 60, flush=True)
 
@@ -227,6 +226,12 @@ def parse_args():
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--val", type=str, required=True)
     parser.add_argument("--mat-dir", type=str, required=True)
+    parser.add_argument(
+        "--val-ecg-npz",
+        type=str,
+        default=None,
+        help="Optional preprocessed ECG cache aligned with --val JSONL.",
+    )
     parser.add_argument("--encoder-ckpt", type=str, default=None)
     parser.add_argument("--llm-name", type=str, default=DEFAULT_QWEN_NAME)
     parser.add_argument("--ecg-len", type=int, default=2400)
@@ -246,6 +251,7 @@ if __name__ == "__main__":
         mat_dir=args.mat_dir,
         llm_name=args.llm_name,
         encoder_ckpt=args.encoder_ckpt,
+        val_ecg_npz=args.val_ecg_npz,
         ecg_len=args.ecg_len,
         downsample=args.downsample,
         max_length=args.max_length,

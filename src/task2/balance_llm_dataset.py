@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--positive-answer",
         type=str,
-        default="有房颤。",
+        default="有房颤。心电图表现为 R-R 间期明显不规则，P 波缺失或被 f 波替代。",
         help="Answer string that should be considered a positive sample.",
     )
     parser.add_argument(

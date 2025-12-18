@@ -67,6 +67,11 @@ class ECGQwenForAF(nn.Module):
         hidden_size = self.llm.config.hidden_size
         self.hidden_size = hidden_size
         self.proj = nn.Linear(ecg_adapter_dim, hidden_size * self.ecg_token_count)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, 1),
+        )
 
     def forward(self, ecg, input_ids, attention_mask=None, labels=None):
         inputs_embeds, full_attention_mask = self.prepare_inputs_for_generation(
@@ -130,6 +135,32 @@ class ECGQwenForAF(nn.Module):
             full_attention_mask = None
 
         return inputs_embeds, full_attention_mask
+
+    def classify(self, ecg, input_ids, attention_mask=None):
+        if attention_mask is None:
+            raise ValueError("attention_mask is required for classification.")
+
+        inputs_embeds, full_attention_mask = self.prepare_inputs_for_generation(
+            ecg=ecg,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1]
+
+        attn = attention_mask.to(hidden.device)
+        seq_lens = attn.sum(dim=1).to(torch.long)
+        idxs = seq_lens + self.ecg_token_count - 1
+        batch_indices = torch.arange(hidden.size(0), device=hidden.device)
+        pooled = hidden[batch_indices, idxs]
+        pooled = pooled.to(dtype=self.classifier[0].weight.dtype)
+        logits = self.classifier(pooled).squeeze(-1)
+        return logits
 
     def encode_text(self, prompt_texts: List[str], add_special_tokens: bool = True, max_length: int = 256):
         batch = self.tokenizer(
